@@ -31,6 +31,38 @@ def apply_rotary_emb(xq: jax.Array, xk: jax.Array, freqs_cis: jax.Array, dtype: 
   xk_out = jnp.stack((jnp.real(xk_out), jnp.imag(xk_out)), axis=-1).reshape(*xk_out.shape[:-1], -1)
   return xq_out.astype(dtype), xk_out.astype(dtype)
 
+def sageattn(q, k, v, model_params, attn_mask = None, is_causal = False, smooth_k = True) -> Tuple[jax.Array, KVCache]:
+  # Smoothing of key matrix
+  if smooth_k:
+        k = k - jnp.mean(k, axis=-2, keepdims=True)
+  
+  # Quantize Q and K to INT8
+  def quantize_int8(x):
+      scale = jnp.max(jnp.abs(x), axis=-1, keepdims=True) / 127.
+      x_int8 = jnp.round(x / scale).astype(jnp.int8)
+      return x_int8, scale
+  
+  q_int8, q_scale = quantize_int8(q)
+  k_int8, k_scale = quantize_int8(k)
+
+  # Attention scores in INT8
+  scores = jnp.matmul(q_int8, k_int8.transpose(-1, -2))
+  scores = scores.astype(jnp.float32) * (q_scale * k_scale.transpose(-1, -2))
+  pre_scores = scores / jnp.sqrt(model_params.head_dim)
+
+  if attn_mask is not None:
+      scores = scores + attn_mask
+
+  if is_causal:
+      mask = jnp.tril(jnp.ones_like(scores))
+      scores = jnp.where(mask == 0, float('-inf'), scores)
+  
+  attn_weights = jax.nn.softmax(scores, axis=-1)
+
+  output = jnp.matmul(attn_weights.astype(jnp.float16), v.astype(jnp.float16))
+
+  return output.astype(q.dtype), pre_scores
+
 #@partial(jax.jit, static_argnames=("model_params", "cur_pos", "layer_idx"))
 def attention(x: jax.Array, layer_weights: LayerWeights, model_params, cur_pos: int, layer_idx: int, freqs_cis: jax.Array, kvcache: KVCache, attn_mask: Optional[jax.Array] = None) -> Tuple[jax.Array, KVCache]:
   bsz, _, _ = x.shape
@@ -40,20 +72,19 @@ def attention(x: jax.Array, layer_weights: LayerWeights, model_params, cur_pos: 
   xv = jnp.dot(x, layer_weights.wv.T).reshape(bsz, -1, model_params.n_local_kv_heads, model_params.head_dim)
   xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
   keys, values, kvcache = kvcache.update(xk, xv, layer_idx, cur_pos, n_rep)
+  
   xq = jnp.transpose(xq, (0, 2, 1, 3))  # (bs, n_heads, seqlen, head_dim)
   keys = jnp.transpose(keys, (0, 2, 3, 1))  # (bs, n_heads, head_dim, cache_len + seqlen)
   values = jnp.transpose(values, (0, 2, 1, 3))  # (bs, n_heads, cache_len + seqlen, head_dim)
-  scores = jnp.matmul(xq, keys)
-  pre_scores = scores / jnp.sqrt(model_params.head_dim)
-  scores = pre_scores.astype(jnp.float32)  # Always do attention softmax at float32
-  if cur_pos == 0:
-    scores = scores + attn_mask
-  mask = jnp.where(scores != 0.0, scores, DEFAULT_MASK_VALUE)
-  padded_logits = jnp.where((mask >= DEFAULT_MASK_VALUE * 0.5), scores, DEFAULT_MASK_VALUE)
-  scores = jax.nn.softmax(padded_logits, axis=-1).astype(x.dtype)
-  output = jnp.matmul(scores, values)
-  output = jnp.swapaxes(output, 1, 2).reshape(xq.shape[0], xq.shape[2], -1)
+  
+  # Apply SageAttention
+  is_causal = cur_pos > 0
+  output, pre_scores = sageattn(xq, keys, values, model_params, attn_mask, is_causal=is_causal)
+
+  # Reshape output and apply final linear transformation
+  output = jnp.transpose(output, (0, 2, 1, 3)).reshape(xq.shape[0], xq.shape[2], -1)
   out = jnp.dot(output, layer_weights.wo.T)
+
   return out, kvcache, pre_scores
 
 #@partial(jax.jit)
