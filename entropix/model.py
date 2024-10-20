@@ -46,8 +46,8 @@ def sageattn(q, k, v, model_params, attn_mask = None, is_causal = False, smooth_
   k_int8, k_scale = quantize_int8(k)
 
   # Attention scores in INT8
-  scores = jnp.matmul(q_int8, k_int8.transpose(-1, -2))
-  scores = scores.astype(jnp.float32) * (q_scale * k_scale.transpose(-1, -2))
+  scores = jnp.matmul(q_int8, k_int8)
+  scores = scores.astype(jnp.float32) * (q_scale * jnp.transpose(k_scale, (0, 1, 3, 2)))
   pre_scores = scores / jnp.sqrt(model_params.head_dim)
 
   if attn_mask is not None:
